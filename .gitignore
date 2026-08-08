@@ -1,0 +1,12 @@
+# Vector store — contains extracted text from whatever you've indexed.
+# Never commit this; it may include personal/sensitive document content.
+chroma_db/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# macOS
+.DS_Store
