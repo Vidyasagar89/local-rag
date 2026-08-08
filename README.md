@@ -1,3 +1,6 @@
+<img width="767" height="866" alt="Screenshot 2026-08-08 at 10 40 53 PM" src="https://github.com/user-attachments/assets/36ca2bb5-994c-481a-8bbb-469af45c0c44" />
+
+
 # Local RAG (fully offline)
 
 A minimal, offline RAG system built for a small machine (tested against an
