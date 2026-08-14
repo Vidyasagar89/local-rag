@@ -9,6 +9,7 @@ import os
 import tempfile
 from flask import Flask, request, jsonify, render_template_string
 from rag_core import add_document, answer_question, SUPPORTED_EXTENSIONS, list_sources, delete_document
+from web_search import answer_from_web, WebSearchUnavailable
 
 app = Flask(__name__)
 
@@ -198,6 +199,9 @@ PAGE = """
   <div id="chat"></div>
   <div class="ask-row">
     <input type="text" id="question" placeholder="Ask something about your docs..." onkeydown="if(event.key==='Enter') ask()">
+    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-dim);white-space:nowrap;cursor:pointer;">
+      <input type="checkbox" id="useWeb" style="accent-color:var(--accent);"> Web
+    </label>
     <button onclick="ask()" id="askBtn">Ask</button>
   </div>
 </div>
@@ -283,16 +287,23 @@ async function ask() {
   `);
   chat.scrollTop = chat.scrollHeight;
 
+  const useWeb = document.getElementById('useWeb').checked;
+
   try {
     const res = await fetch('/ask', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: q})
+      body: JSON.stringify({question: q, use_web: useWeb})
     });
     const data = await res.json();
     document.getElementById(thinkingId).remove();
+    const sourceLabels = data.sources.map(s =>
+      s.startsWith('http')
+        ? `<a href="${escapeHtml(s)}" target="_blank" style="color:var(--accent)">${escapeHtml(s)}</a>`
+        : escapeHtml(s)
+    );
     const sourcesHtml = data.sources.length
-      ? `<div class="sources">Sources: ${data.sources.map(escapeHtml).join(', ')}</div>` : '';
+      ? `<div class="sources">${useWeb ? 'Web sources' : 'Sources'}: ${sourceLabels.join(', ')}</div>` : '';
     chat.insertAdjacentHTML('beforeend', `
       <div class="msg bot">
         <div class="role">Assistant</div>
@@ -360,8 +371,17 @@ def delete():
 @app.route("/ask", methods=["POST"])
 def ask():
     question = request.json.get("question", "")
-    answer, hits = answer_question(question)
-    sources = sorted({meta["source"] for _, meta in hits})
+    use_web = bool(request.json.get("use_web", False))
+
+    if use_web:
+        try:
+            answer, sources = answer_from_web(question)
+        except WebSearchUnavailable as e:
+            return jsonify({"answer": str(e), "sources": []})
+    else:
+        answer, hits = answer_question(question)
+        sources = sorted({meta["source"] for _, meta in hits})
+
     return jsonify({"answer": answer, "sources": sources})
 
 
