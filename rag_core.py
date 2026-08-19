@@ -26,10 +26,10 @@ TOP_K = 8              # how many chunks to retrieve per question (was 4)
 # missing the right one — just give the model everything.
 SMALL_COLLECTION_THRESHOLD = 25
 
-# Before retrieving, ask the LLM for a couple of alternate phrasings of the
-# question and search with all of them. This is the fix for "rephrasing gave
-# me the right answer" — instead of relying on you to rephrase, the system
-# does it automatically and merges the results.
+# Before retrieving, ask the LLM for a single alternate phrasing of the
+# question and search with both the original and alternate. This is the fix
+# for "rephrasing gave me the right answer" — instead of relying on you to
+# rephrase, the system does it automatically and merges the results.
 QUERY_EXPANSION = True
 
 SUPPORTED_EXTENSIONS = {
@@ -177,14 +177,14 @@ def _bm25_scores(question: str, ids, docs):
 
 
 def expand_queries(question: str):
-    """Ask the LLM for 1-2 alternate phrasings to widen recall automatically."""
+    """Ask the LLM for a single alternate phrasing to widen recall automatically."""
     if not QUERY_EXPANSION:
         return [question]
     prompt = (
-        "Rewrite the question below as 2 alternate phrasings that a document "
+        "Rewrite the question below as a single alternate phrasing that a document "
         "might use for the same underlying fact (different wording, synonyms, "
-        "more formal or more literal phrasing). Return ONLY the 2 alternates, "
-        "one per line, with no numbering and no extra commentary.\n\n"
+        "more formal or more literal phrasing). Return ONLY the alternate, "
+        "on a single line, with no numbering and no extra commentary.\n\n"
         f"Question: {question}"
     )
     try:
@@ -192,7 +192,7 @@ def expand_queries(question: str):
                                {"role": "user", "content": prompt}])
         alt_lines = [l.strip("-• ").strip() for l in response["message"]
                      ["content"].splitlines() if l.strip()]
-        return [question] + alt_lines[:2]
+        return [question] + alt_lines[:1]
     except Exception:
         return [question]
 

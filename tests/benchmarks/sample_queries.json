@@ -1,0 +1,14 @@
+[
+  {
+    "query": "What models does this project use for embeddings and generation?",
+    "expected_sources": ["README.md"]
+  },
+  {
+    "query": "How do I index my documents?",
+    "expected_sources": ["README.md"]
+  },
+  {
+    "query": "What is the chunk size used in rag_core?",
+    "expected_sources": ["rag_core.py"]
+  }
+]
