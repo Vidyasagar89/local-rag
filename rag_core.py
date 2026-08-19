@@ -11,7 +11,7 @@ from rank_bm25 import BM25Okapi
 # ---- Config (tune these for your 8GB M1 Mac mini) ----
 EMBED_MODEL = "nomic-embed-text"   # ~270MB, light on RAM
 # swap for phi3.5 / gemma2:2b if you want it lighter
-LLM_MODEL = "llama3.2:3b"
+LLM_MODEL = "granite4.1:3b"
 CHROMA_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
 COLLECTION_NAME = "local_docs"
 
