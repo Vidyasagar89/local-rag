@@ -66,9 +66,9 @@ document', reworded it, got the right answer" problem:
   a top-k search trying to guess which few are relevant. Nothing can get
   "missed" if nothing gets filtered out.
 - **Query expansion.** For larger collections, before searching, the LLM is
-  asked to generate 1-2 alternate phrasings of your question, and all of them
-  are searched. This is the automatic version of what you were doing by hand
-  when rewording the question fixed it.
+  asked to generate a single alternate phrasing of your question, and both the
+  original and alternate are searched. This is the automatic version of
+  rewording the question yourself when it fixed a missed result.
 - **Hybrid vector + keyword search.** Embedding search alone can miss exact
   terms (names, numbers, jargon) if the wording doesn't line up. A BM25
   keyword pass runs alongside the vector search and the two are merged, so an
