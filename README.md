@@ -55,6 +55,23 @@ python app.py
 
 Upload files directly in the browser and chat with them.
 
+### Open it from your phone
+
+Same approach as [local-llm](../local-llm): `app.py` binds to `0.0.0.0`
+and prints a LAN URL on startup, so any device on the same WiFi network
+can reach it:
+
+```
+Local RAG is starting...
+Open on your phone: http://<your-pc-lan-ip>:5050
+Other LAN addresses: ...
+Local browser: http://localhost:5050
+```
+
+Open that first URL on your phone's browser (same WiFi, not guest WiFi —
+that usually isolates devices from each other). If it won't connect, check
+your PC's firewall allows inbound connections on port 5050.
+
 ## How retrieval works now
 
 Three changes in `rag_core.py` fix the "asked one way, got 'not in the
@@ -107,13 +124,43 @@ one context, so the answer bubble always tells you which source it came
 from. Nothing goes over the network unless you explicitly check the box or
 pass `--web`.
 
+## Performance
+
+The web UI (`app.py`) used to block until the entire answer was generated,
+and re-scanned + re-indexed the whole document collection on every single
+question. Both are fixed now:
+
+- **Streaming answers.** `/ask` streams newline-delimited JSON and the
+  browser renders tokens as they arrive (same idea as local-llm's
+  token-by-token chat), instead of waiting for the full response. This is
+  the single biggest improvement in *perceived* speed — generation itself
+  takes the same time, but you're not staring at a blank bubble for it.
+- **Cached corpus + BM25 index.** `retrieve()` used to call
+  `collection.get()` (every id/document/metadata in the index) and rebuild
+  a BM25 index from scratch on every question. Both are now cached in
+  `rag_core.py` and only rebuilt when the chunk count actually changes —
+  cheap on every other question.
+- **Models kept warm.** Every question round-trips through two different
+  Ollama models (`nomic-embed-text` for embedding, `LLM_MODEL` for
+  generation). By default Ollama can evict one to load the other between
+  those two calls, which shows up as multi-second stalls. All Ollama calls
+  in this project now pass `keep_alive="30m"` (see `KEEP_ALIVE` in
+  `rag_core.py`) so a model isn't dropped right after use. For this to let
+  *both* models sit in RAM at once rather than still taking turns, also
+  set `OLLAMA_MAX_LOADED_MODELS=2` in the environment `ollama serve` runs
+  in, e.g.:
+  ```bash
+  OLLAMA_MAX_LOADED_MODELS=2 ollama serve
+  ```
+  On an 8GB machine, `nomic-embed-text` (~270MB) plus a 3B model in Q4
+  (~2GB) fit in memory together fine; if you're on something even tighter,
+  leave this unset and accept the occasional reload instead.
+
 ## Notes for your hardware
 
 - Chunk size (1200 chars) and top_k (8) in `rag_core.py` are tuned to keep
   prompts reasonably small while giving retrieval more to work with —
   increase them once you confirm speed is acceptable.
-- Ollama loads/unloads models automatically, so embedding + generation
-  models don't both have to sit in memory at once, which helps a lot at 8GB.
 - The Chroma DB persists to `./chroma_db` — delete that folder to reset
   the index from scratch.
 - Query expansion adds one extra LLM call per question. If it feels slow on

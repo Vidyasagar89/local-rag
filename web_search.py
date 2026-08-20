@@ -23,7 +23,7 @@ import requests
 import ollama
 from dotenv import load_dotenv
 
-from rag_core import LLM_MODEL
+from rag_core import LLM_MODEL, KEEP_ALIVE
 
 # Load variables from a .env file in the project root, if present. This is
 # independent of your shell's startup files (.zshrc, .bashrc, etc.), so it
@@ -73,14 +73,7 @@ def search_web(query: str, max_results: int = WEB_TOP_K):
     ]
 
 
-def answer_from_web(question: str, max_results: int = WEB_TOP_K):
-    """
-    Search the web and generate an answer grounded in those results.
-    Mirrors rag_core.answer_question()'s shape (answer, sources) so app.py
-    and query.py can treat the two paths interchangeably at the call site.
-    """
-    results = search_web(question, max_results=max_results)
-
+def _build_messages(question: str, results):
     if not results:
         context = "(no web results found)"
     else:
@@ -95,14 +88,42 @@ def answer_from_web(question: str, max_results: int = WEB_TOP_K):
         "when relevant."
     )
     user_prompt = f"Web search results:\n{context}\n\nQuestion: {question}"
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+
+def answer_from_web(question: str, max_results: int = WEB_TOP_K):
+    """
+    Search the web and generate an answer grounded in those results.
+    Mirrors rag_core.answer_question()'s shape (answer, sources) so
+    query.py can treat the two paths interchangeably at the call site.
+    """
+    results = search_web(question, max_results=max_results)
+    messages = _build_messages(question, results)
+
+    response = ollama.chat(model=LLM_MODEL, messages=messages,
+                            keep_alive=KEEP_ALIVE)
 
     sources = [r["url"] for r in results]
     return response["message"]["content"], sources
+
+
+def answer_from_web_stream(question: str, max_results: int = WEB_TOP_K):
+    """Streaming counterpart to answer_from_web, mirroring
+    rag_core.answer_question_stream()'s (kind, payload) shape:
+
+        ("sources", [url, ...])   -- once, right after the search
+        ("token", text_delta)     -- repeatedly, as generation streams in
+    """
+    results = search_web(question, max_results=max_results)
+    yield "sources", [r["url"] for r in results]
+
+    messages = _build_messages(question, results)
+    stream = ollama.chat(model=LLM_MODEL, messages=messages,
+                          keep_alive=KEEP_ALIVE, stream=True)
+    for chunk in stream:
+        delta = chunk.get("message", {}).get("content", "")
+        if delta:
+            yield "token", delta

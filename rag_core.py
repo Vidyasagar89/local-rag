@@ -15,6 +15,17 @@ LLM_MODEL = "granite4.1:3b"
 CHROMA_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
 COLLECTION_NAME = "local_docs"
 
+# How long Ollama keeps each model resident in RAM after a request. We
+# alternate between EMBED_MODEL and LLM_MODEL on every question, so without
+# this Ollama's default (5m, and it can be even more aggressive under memory
+# pressure) can evict one to make room for the other between the embedding
+# call and the generation call -- that reload is most of the "why is this
+# slow" latency. 30m keeps both warm across a normal chat session. For this
+# to actually let both sit in RAM at once (not just take turns), also set
+# OLLAMA_MAX_LOADED_MODELS=2 (or higher) in the environment `ollama serve`
+# runs in -- see README.
+KEEP_ALIVE = "30m"
+
 # characters per chunk (was 800 — bigger keeps labels + values together)
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 250    # overlap so context isn't cut mid-thought
@@ -119,7 +130,8 @@ def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
 
 def embed(text: str):
-    response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+    response = ollama.embeddings(
+        model=EMBED_MODEL, prompt=text, keep_alive=KEEP_ALIVE)
     return response["embedding"]
 
 
@@ -142,6 +154,7 @@ def add_document(filepath: str):
     if ids:
         collection.upsert(ids=ids, embeddings=embeddings,
                           documents=documents, metadatas=metadatas)
+        _invalidate_corpus_cache()
     return len(ids)
 
 
@@ -152,26 +165,67 @@ def delete_document(filename: str) -> int:
     count = len(existing.get("ids", []))
     if count:
         collection.delete(where={"source": filename})
+        _invalidate_corpus_cache()
     return count
+
+
+# ---- Corpus + BM25 caching ----
+# retrieve() used to call collection.get() (a full read of every id,
+# document, and metadata in the index) and rebuild a BM25 index over the
+# whole corpus from scratch on *every question*. For anything but a tiny
+# collection that's the dominant cost before the LLM even starts generating.
+# We cache both here and only refresh when the collection has actually
+# changed. collection.count() is cheap (no document payload), so checking it
+# every call is fine even though it can't be skipped -- it's what lets us
+# notice edits made by another process (ingest.py, manage.py) too.
+_corpus_cache = {"count": None, "ids": [],
+                  "documents": [], "metadatas": [], "bm25": None}
+
+
+def _invalidate_corpus_cache():
+    _corpus_cache["count"] = None
+
+
+def _get_corpus():
+    """Return (ids, documents, metadatas) for the whole collection, cached
+    until the chunk count changes."""
+    collection = get_collection()
+    count = collection.count()
+    if _corpus_cache["count"] != count:
+        all_docs = collection.get()
+        _corpus_cache["ids"] = all_docs.get("ids", [])
+        _corpus_cache["documents"] = all_docs.get("documents", [])
+        _corpus_cache["metadatas"] = all_docs.get("metadatas", [])
+        _corpus_cache["bm25"] = None  # stale, rebuild lazily below
+        _corpus_cache["count"] = count
+    return _corpus_cache["ids"], _corpus_cache["documents"], _corpus_cache["metadatas"]
 
 
 def list_sources():
     """Return the distinct set of filenames currently indexed."""
-    collection = get_collection()
-    all_docs = collection.get()
-    return sorted({meta["source"] for meta in all_docs.get("metadatas", [])})
+    _, _, all_metas = _get_corpus()
+    return sorted({meta["source"] for meta in all_metas})
 
 
 def _tokenize(text: str):
     return re.findall(r"\w+", text.lower())
 
 
+def _get_bm25(ids, docs):
+    """Build (or reuse) the BM25 index for the current corpus. Tokenizing
+    every document is the expensive part, so this only happens once per
+    corpus version instead of once per question."""
+    if _corpus_cache["bm25"] is None and docs:
+        tokenized_docs = [_tokenize(d) for d in docs]
+        _corpus_cache["bm25"] = BM25Okapi(tokenized_docs)
+    return _corpus_cache["bm25"]
+
+
 def _bm25_scores(question: str, ids, docs):
-    """Keyword-overlap ranking, as a fallback for terms the embedding misses."""
-    if not docs:
+    """Keyword-overlap ranking, as a fallback for terms the embedding missed."""
+    bm25 = _get_bm25(ids, docs)
+    if bm25 is None:
         return {}
-    tokenized_docs = [_tokenize(d) for d in docs]
-    bm25 = BM25Okapi(tokenized_docs)
     scores = bm25.get_scores(_tokenize(question))
     return dict(zip(ids, scores))
 
@@ -189,7 +243,7 @@ def expand_queries(question: str):
     )
     try:
         response = ollama.chat(model=LLM_MODEL, messages=[
-                               {"role": "user", "content": prompt}])
+                               {"role": "user", "content": prompt}], keep_alive=KEEP_ALIVE)
         alt_lines = [l.strip("-• ").strip() for l in response["message"]
                      ["content"].splitlines() if l.strip()]
         return [question] + alt_lines[:1]
@@ -199,10 +253,7 @@ def expand_queries(question: str):
 
 def retrieve(question: str, top_k=TOP_K):
     collection = get_collection()
-    all_docs = collection.get()
-    all_ids = all_docs.get("ids", [])
-    all_documents = all_docs.get("documents", [])
-    all_metas = all_docs.get("metadatas", [])
+    all_ids, all_documents, all_metas = _get_corpus()
 
     # Small index: don't risk retrieval missing anything, just hand it all over.
     if len(all_ids) <= SMALL_COLLECTION_THRESHOLD:
@@ -244,9 +295,8 @@ def retrieve(question: str, top_k=TOP_K):
     return [(d, m) for d, m, _ in ranked[:top_k]]
 
 
-def answer_question(question: str, top_k=TOP_K):
-    """Full RAG pipeline: retrieve relevant chunks, then generate a grounded answer."""
-    hits = retrieve(question, top_k=top_k)
+def _build_messages(question: str, hits):
+    """Shared prompt construction for both the streaming and one-shot paths."""
     if not hits:
         context = "(no documents indexed yet)"
     else:
@@ -261,12 +311,39 @@ def answer_question(question: str, top_k=TOP_K):
         "when relevant."
     )
     user_prompt = f"Context:\n{context}\n\nQuestion: {question}"
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+
+def answer_question(question: str, top_k=TOP_K):
+    """Full RAG pipeline: retrieve relevant chunks, then generate a grounded
+    answer in one shot. Used by the CLI tools (query.py); the web app uses
+    answer_question_stream instead so it can show tokens as they arrive."""
+    hits = retrieve(question, top_k=top_k)
+    messages = _build_messages(question, hits)
+    response = ollama.chat(model=LLM_MODEL, messages=messages,
+                            keep_alive=KEEP_ALIVE)
     return response["message"]["content"], hits
+
+
+def answer_question_stream(question: str, top_k=TOP_K):
+    """Same pipeline as answer_question, but retrieves first (fast, no LLM),
+    yields the hits immediately, then yields answer text incrementally as
+    Ollama generates it instead of blocking until the full answer is done.
+
+    Yields:
+        ("hits", hits)              -- once, right after retrieval
+        ("token", text_delta)       -- repeatedly, as generation streams in
+    """
+    hits = retrieve(question, top_k=top_k)
+    yield "hits", hits
+
+    messages = _build_messages(question, hits)
+    stream = ollama.chat(model=LLM_MODEL, messages=messages,
+                          keep_alive=KEEP_ALIVE, stream=True)
+    for chunk in stream:
+        delta = chunk.get("message", {}).get("content", "")
+        if delta:
+            yield "token", delta

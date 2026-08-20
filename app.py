@@ -6,12 +6,48 @@ Usage:
     then open http://localhost:5050
 """
 import os
+import json
+import socket
 import tempfile
-from flask import Flask, request, jsonify, render_template_string
-from rag_core import add_document, answer_question, SUPPORTED_EXTENSIONS, list_sources, delete_document
-from web_search import answer_from_web, WebSearchUnavailable
+from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
+from rag_core import add_document, answer_question_stream, SUPPORTED_EXTENSIONS, list_sources, delete_document
+from web_search import answer_from_web_stream, WebSearchUnavailable
 
 app = Flask(__name__)
+
+
+def get_access_urls(port: int):
+    """Return a concise list of URLs that are useful on the same network.
+    Mirrors local-llm's backend/main.py so both projects behave the same
+    way when you open them from your phone."""
+    candidates = []
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            local_ip = sock.getsockname()[0]
+            if local_ip not in candidates:
+                candidates.append(local_ip)
+    except OSError:
+        pass
+
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(
+            socket.gethostname(), None, type=socket.SOCK_DGRAM
+        ):
+            if family == socket.AF_INET:
+                ip = sockaddr[0]
+                if ip not in candidates and not ip.startswith("127."):
+                    candidates.append(ip)
+    except OSError:
+        pass
+
+    urls = [
+        f"http://{ip}:{port}" for ip in candidates if not ip.startswith("127.")]
+    if not urls:
+        urls = [f"http://localhost:{port}"]
+
+    return urls
 
 PAGE = """
 <!DOCTYPE html>
@@ -288,6 +324,36 @@ async function ask() {
   chat.scrollTop = chat.scrollHeight;
 
   const useWeb = document.getElementById('useWeb').checked;
+  let botEl = null;
+  let bubbleEl = null;
+  let answerText = '';
+  let sources = [];
+
+  function renderSources() {
+    if (!sources.length || !botEl) return;
+    const existing = botEl.querySelector('.sources');
+    if (existing) existing.remove();
+    const labels = sources.map(s =>
+      s.startsWith('http')
+        ? `<a href="${escapeHtml(s)}" target="_blank" style="color:var(--accent)">${escapeHtml(s)}</a>`
+        : escapeHtml(s)
+    );
+    botEl.insertAdjacentHTML('beforeend',
+      `<div class="sources">${useWeb ? 'Web sources' : 'Sources'}: ${labels.join(', ')}</div>`);
+  }
+
+  function ensureBotBubble() {
+    if (botEl) return;
+    document.getElementById(thinkingId).remove();
+    chat.insertAdjacentHTML('beforeend', `
+      <div class="msg bot">
+        <div class="role">Assistant</div>
+        <div class="bubble"></div>
+      </div>
+    `);
+    botEl = chat.lastElementChild;
+    bubbleEl = botEl.querySelector('.bubble');
+  }
 
   try {
     const res = await fetch('/ask', {
@@ -295,27 +361,46 @@ async function ask() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question: q, use_web: useWeb})
     });
-    const data = await res.json();
-    document.getElementById(thinkingId).remove();
-    const sourceLabels = data.sources.map(s =>
-      s.startsWith('http')
-        ? `<a href="${escapeHtml(s)}" target="_blank" style="color:var(--accent)">${escapeHtml(s)}</a>`
-        : escapeHtml(s)
-    );
-    const sourcesHtml = data.sources.length
-      ? `<div class="sources">${useWeb ? 'Web sources' : 'Sources'}: ${sourceLabels.join(', ')}</div>` : '';
-    chat.insertAdjacentHTML('beforeend', `
-      <div class="msg bot">
-        <div class="role">Assistant</div>
-        <div class="bubble">${escapeHtml(data.answer)}</div>
-        ${sourcesHtml}
-      </div>
-    `);
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+    // Server streams newline-delimited JSON; a chunk can split mid-line, so
+    // buffer partial lines across reads instead of assuming one line == one chunk.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();  // last element may be an incomplete line
+
+      for (const raw of lines) {
+        if (!raw.trim()) continue;
+        const msg = JSON.parse(raw);
+        if (msg.type === 'sources') {
+          sources = msg.sources || [];
+          ensureBotBubble();
+          renderSources();
+        } else if (msg.type === 'token') {
+          ensureBotBubble();
+          answerText += msg.text;
+          bubbleEl.textContent = answerText;
+          chat.scrollTop = chat.scrollHeight;
+        } else if (msg.type === 'error') {
+          ensureBotBubble();
+          bubbleEl.textContent = msg.message;
+        } else if (msg.type === 'done') {
+          renderSources();
+        }
+      }
+    }
+    ensureBotBubble();  // covers an empty/no-token answer
   } catch (e) {
-    document.getElementById(thinkingId).remove();
-    chat.insertAdjacentHTML('beforeend', `
-      <div class="msg bot"><div class="role">Assistant</div><div class="bubble">Something went wrong: ${escapeHtml(String(e))}</div></div>
-    `);
+    if (document.getElementById(thinkingId)) document.getElementById(thinkingId).remove();
+    ensureBotBubble();
+    bubbleEl.textContent = `Something went wrong: ${String(e)}`;
   } finally {
     input.disabled = false;
     askBtn.disabled = false;
@@ -370,20 +455,62 @@ def delete():
 
 @app.route("/ask", methods=["POST"])
 def ask():
+    """
+    Streams the answer as newline-delimited JSON (same idea as local-llm's
+    NDJSON model-pull progress) instead of blocking until the whole answer
+    is generated. Each line is one JSON object:
+
+        {"type": "sources", "sources": [...]}   -- once, up front
+        {"type": "token", "text": "..."}        -- many, as tokens arrive
+        {"type": "done"}                        -- once, at the end
+        {"type": "error", "message": "..."}     -- instead of the above, on failure
+    """
     question = request.json.get("question", "")
     use_web = bool(request.json.get("use_web", False))
 
-    if use_web:
-        try:
-            answer, sources = answer_from_web(question)
-        except WebSearchUnavailable as e:
-            return jsonify({"answer": str(e), "sources": []})
-    else:
-        answer, hits = answer_question(question)
-        sources = sorted({meta["source"] for _, meta in hits})
+    def generate():
+        def line(obj):
+            return json.dumps(obj) + "\n"
 
-    return jsonify({"answer": answer, "sources": sources})
+        try:
+            if use_web:
+                stream = answer_from_web_stream(question)
+                sources_kind = "sources"
+            else:
+                stream = answer_question_stream(question)
+                sources_kind = "hits"
+
+            for kind, payload in stream:
+                if kind == sources_kind:
+                    if sources_kind == "hits":
+                        sources = sorted({meta["source"]
+                                          for _, meta in payload})
+                    else:
+                        sources = payload
+                    yield line({"type": "sources", "sources": sources})
+                elif kind == "token":
+                    yield line({"type": "token", "text": payload})
+            yield line({"type": "done"})
+        except WebSearchUnavailable as e:
+            yield line({"type": "error", "message": str(e)})
+        except Exception as e:
+            yield line({"type": "error", "message": f"Something went wrong: {e}"})
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    port = int(os.environ.get("PORT", 5050))
+    urls = get_access_urls(port)
+
+    print("\nLocal RAG is starting...")
+    print(f"Open on your phone: {urls[0]}")
+    if len(urls) > 1:
+        print("Other LAN addresses: " + ", ".join(urls[1:]))
+    print(f"Local browser: http://localhost:{port}\n")
+
+    # host 0.0.0.0 is what makes this reachable from your phone over WiFi at
+    # http://<your-pc-lan-ip>:5050 -- 127.0.0.1 would only work on this
+    # machine. threaded=True lets the dev server handle another request
+    # (e.g. /files) while a streaming /ask response is still in flight.
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
