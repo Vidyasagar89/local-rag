@@ -373,7 +373,7 @@ async function ask() {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
+      const lines = buffer.split('\\n');
       buffer = lines.pop();  // last element may be an incomplete line
 
       for (const raw of lines) {
